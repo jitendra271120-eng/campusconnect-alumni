@@ -1,0 +1,170 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function isSelf(id) { return signedIn() && request.auth.uid == id; }
+    function accountPath() { return /databases/$(database)/documents/alumni_users/$(request.auth.uid); }
+    function hasAccount() { return signedIn() && exists(accountPath()); }
+    function account() { return get(accountPath()).data; }
+    function isStaff() { return hasAccount() && account().status == 'verified' && account().role in ['admin','super_admin']; }
+    function isSuperAdmin() { return isStaff() && account().role == 'super_admin'; }
+    function isVerified() { return hasAccount() && account().status == 'verified'; }
+    // Email OTP is server-attested by Cloud Functions; never writable by clients.
+    // College approval and email verification are independent statuses.
+    function hasEmailCode() { return hasAccount()
+      && ('emailCodeVerifiedAt' in account())
+      && account().emailCodeVerifiedAt is timestamp; }
+    function activeEmailMember() { return hasEmailCode()
+      && account().status in ['pending','verified']
+      && account().role in ['alumni','student']; }
+    function isAlumni() { return activeEmailMember() && account().role == 'alumni'; }
+    function same(key) { return request.resource.data[key] == resource.data[key]; }
+    function keysOnly(keys) { return request.resource.data.keys().hasOnly(keys); }
+
+    match /alumni_users/{userId} {
+      allow get: if isSelf(userId) || isStaff();
+      allow list: if isStaff();
+      allow create: if isSelf(userId)
+        && request.resource.data.uid == userId
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role in ['alumni','student']
+        && request.resource.data.status == 'pending'
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2
+        && request.resource.data.name.size() <= 120
+        && request.resource.data.rollNumber is string
+        && request.resource.data.rollNumber.size() <= 35
+        && keysOnly(['uid','name','email','role','rollNumber','program','department','graduationYear','status','createdAt','updatedAt']);
+      // No self-service role, verification, or academic-identity edits.
+      allow update: if isSuperAdmin() || (isStaff()
+        && resource.data.role in ['alumni','student']
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedAt'])
+        && request.resource.data.status in ['pending','verified','rejected']);
+      allow delete: if false;
+    }
+    match /alumni_profiles/{profileId} {
+      allow get: if resource.data.directoryStatus == 'listed' || isSelf(resource.data.ownerId) || isStaff();
+      allow list: if resource.data.directoryStatus == 'listed' || isStaff() || isSelf(resource.data.ownerId);
+      // getAfter sees the users doc created in the same registration write batch.
+      allow create: if isSelf(profileId)
+        && request.resource.data.ownerId == profileId
+        && getAfter(/databases/$(database)/documents/alumni_users/$(profileId)).data.role == 'alumni'
+        && request.resource.data.directoryStatus == 'unlisted';
+      allow update: if isStaff() || (activeEmailMember() && isSelf(resource.data.ownerId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'displayName','headline','city','country','company','jobTitle','careerStatus','about','linkedin','website','skills','mentorAvailable','directoryStatus','updatedAt'])
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() <= 120
+        && request.resource.data.careerStatus in ['Not specified','Employed','Self-employed','Entrepreneur','Higher Studies','Seeking Employment','Other']
+        && request.resource.data.about.size() <= 2000
+        && (request.resource.data.linkedin == '' || request.resource.data.linkedin.matches('^https://.+'))
+        && (request.resource.data.website == '' || request.resource.data.website.matches('^https://.+'))
+        && request.resource.data.directoryStatus in ['listed','unlisted']
+        && (request.resource.data.directoryStatus == 'unlisted' || (isAlumni() && isVerified())));
+      allow delete: if false;
+    }
+    match /alumni_career_history/{id} {
+      allow read: if isStaff() || (signedIn() && resource.data.ownerId == request.auth.uid);
+      allow create: if isAlumni() && request.resource.data.ownerId == request.auth.uid;
+      allow update: if isAlumni() && resource.data.ownerId == request.auth.uid && same('ownerId')
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['company','role','location','startDate','endDate','description','updatedAt']);
+      allow delete: if isStaff() || (isAlumni() && resource.data.ownerId == request.auth.uid);
+    }
+    match /alumni_education_history/{id} {
+      allow read: if isStaff() || (signedIn() && resource.data.ownerId == request.auth.uid);
+      allow create: if isAlumni() && request.resource.data.ownerId == request.auth.uid;
+      allow update: if isAlumni() && resource.data.ownerId == request.auth.uid && same('ownerId')
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['institution','degree','specialization','startDate','endDate','description','updatedAt']);
+      allow delete: if isStaff() || (isAlumni() && resource.data.ownerId == request.auth.uid);
+    }
+    match /alumni_achievements/{id} {
+      allow read: if isStaff() || (signedIn() && resource.data.ownerId == request.auth.uid);
+      allow create: if isAlumni() && request.resource.data.ownerId == request.auth.uid;
+      allow update: if isAlumni() && resource.data.ownerId == request.auth.uid && same('ownerId')
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['title','organization','year','description','updatedAt']);
+      allow delete: if isStaff() || (isAlumni() && resource.data.ownerId == request.auth.uid);
+    }
+    match /alumni_events/{eventId} {
+      allow read: if resource.data.status == 'published' || isStaff();
+      allow create, update, delete: if isStaff();
+    }
+    match /alumni_event_registrations/{id} {
+      allow read: if isStaff() || (signedIn() && resource.data.userId == request.auth.uid);
+      allow create: if activeEmailMember()
+        && request.resource.data.userId == request.auth.uid
+        && id == request.resource.data.eventId + '_' + request.auth.uid
+        && request.resource.data.status == 'registered'
+        && get(/databases/$(database)/documents/alumni_events/$(request.resource.data.eventId)).data.status == 'published';
+      allow delete: if isStaff() || (activeEmailMember() && resource.data.userId == request.auth.uid);
+      allow update: if isStaff()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedAt'])
+        && request.resource.data.status in ['registered','attended'];
+    }
+    match /alumni_jobs/{id} {
+      allow read: if resource.data.status == 'approved' || isStaff()
+        || (signedIn() && resource.data.authorId == request.auth.uid);
+      allow create: if isAlumni()
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.title is string
+        && request.resource.data.title.size() <= 180
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 3000;
+      allow update, delete: if isStaff();
+    }
+    match /alumni_job_applications/{id} {
+      allow read: if isStaff() || (signedIn() && resource.data.userId == request.auth.uid);
+      allow create: if activeEmailMember()
+        && request.resource.data.userId == request.auth.uid
+        && id == request.resource.data.jobId + '_' + request.auth.uid
+        && get(/databases/$(database)/documents/alumni_jobs/$(request.resource.data.jobId)).data.status == 'approved';
+      allow update, delete: if false;
+    }
+    match /alumni_mentorship_requests/{id} {
+      allow read: if isStaff() || (signedIn() && (resource.data.mentorId == request.auth.uid || resource.data.menteeId == request.auth.uid));
+      allow create: if activeEmailMember()
+        && request.resource.data.menteeId == request.auth.uid
+        && request.resource.data.mentorId != request.auth.uid
+        && request.resource.data.status == 'pending'
+        && id == request.resource.data.mentorId + '_' + request.auth.uid
+        && get(/databases/$(database)/documents/alumni_profiles/$(request.resource.data.mentorId)).data.mentorAvailable == true
+        && get(/databases/$(database)/documents/alumni_profiles/$(request.resource.data.mentorId)).data.directoryStatus == 'listed';
+      allow update: if isStaff() || (activeEmailMember()
+        && resource.data.mentorId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','updatedAt'])
+        && request.resource.data.status in ['accepted','declined']);
+      allow delete: if isStaff() || (activeEmailMember() && resource.data.menteeId == request.auth.uid);
+    }
+    match /alumni_community_posts/{id} {
+      allow read: if isStaff() || resource.data.status == 'approved'
+        || (signedIn() && resource.data.authorId == request.auth.uid);
+      allow create: if activeEmailMember()
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.body is string
+        && request.resource.data.body.size() >= 1
+        && request.resource.data.body.size() <= 1500;
+      allow update: if isStaff();
+      allow delete: if isStaff() || (activeEmailMember() && resource.data.authorId == request.auth.uid);
+    }
+    match /alumni_post_comments/{id} {
+      allow read: if hasAccount() || isStaff();
+      allow create: if activeEmailMember()
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.body is string
+        && request.resource.data.body.size() > 0
+        && request.resource.data.body.size() <= 700
+        && get(/databases/$(database)/documents/alumni_community_posts/$(request.resource.data.postId)).data.status == 'approved';
+      allow update: if false;
+      allow delete: if isStaff() || (activeEmailMember() && resource.data.authorId == request.auth.uid);
+    }
+    match /alumni_news/{id} {
+      allow read: if resource.data.status == 'published' || isStaff();
+      allow create, update, delete: if isStaff();
+    }
+    // Challenge records contain OTP hashes and are accessible to backend Admin SDK only.
+    match /alumni_email_challenges/{id} { allow read, write: if false; }
+    // Deny all other collections, including private metadata or configuration.
+    match /{document=**} { allow read, write: if false; }
+  }
+}

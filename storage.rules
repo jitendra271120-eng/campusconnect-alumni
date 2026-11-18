@@ -1,0 +1,9 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // No file uploads in this release; enable path-scoped rules only when uploads are implemented.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
